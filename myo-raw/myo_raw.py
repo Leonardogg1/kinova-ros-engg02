@@ -303,6 +303,7 @@ class MyoRaw(object):
         self.bt.add_handler(handle_data)
 
 
+
     def write_attr(self, attr, val):
         if self.conn is not None:
             self.bt.write_attr(self.conn, attr, val)
