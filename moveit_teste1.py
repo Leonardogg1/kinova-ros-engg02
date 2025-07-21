@@ -17,6 +17,7 @@ class JacoController:
         moveit_commander.roscpp_initialize(sys.argv)
         rospy.init_node('jaco_controller')
         
+        
         # Setup do moveit
         self.scene = moveit_commander.PlanningSceneInterface()
         self.robot = moveit_commander.RobotCommander()
@@ -103,7 +104,7 @@ class JacoController:
             param = posicao.data # 1 FIST / 4 FINGERS_SPREAD
             self.gripper.set_named_target("Open" if param == 4 else "Close")
             self.gripper.go(wait=True)
-            contg = 0
+            self.contg = 0
             return True
         return True
             
@@ -112,8 +113,6 @@ if __name__ == '__main__':
     try:
         # Inicializando
         jaco = JacoController()
-        rospy.Subscriber("myo_imuQuat", Imu, jaco.move_para_pose)
-        rospy.Subscriber("myo_gest", UInt8, jaco.acao_gripper)
         rospy.spin()
     except rospy.ROSInterruptException:
         print("Programa Interrompido!!!")
