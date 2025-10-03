@@ -7,6 +7,11 @@ import sys
 import threading
 import time
 
+from scipy import signal
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
 import serial
 from serial.tools.list_ports import comports
 
@@ -43,7 +48,113 @@ class Pose(enum.Enum):
     THUMB_TO_PINKY = 5
     UNKNOWN = 255
 
+class Trajectory3D:
+    def __init__(self, max_history=2):
+        # Estado atual
+        self.position = np.zeros(3)       # Posição atual (metros)
+        self.velocity = np.zeros(3)       # Velocidade atual (m/s)
+        self.acceleration = np.zeros(3)   # Aceleração atual (m/s²)
+        self.prev_acceleration = np.zeros(3)  # Aceleração anterior
+        
+        # Configuração
+        self.max_history = max_history    # Tamanho máximo do histórico
+        self.history = []                 # Buffer circular de posições
+        self.last_time = time.time()      # Último timestamp
+        self.gravity = np.array([0, 0.0, 0.969])  # Vetor gravidade
+        
+        # Filtros e parâmetros
+        self.accel_filter = np.zeros(3)   # Filtro para aceleração
+        self.alpha = 1                 # Fator de suavização
+        self.velocity_damping = 0.98      # Amortecimento de velocidade para reduzir drift
+        self.accel_bias = np.zeros(3)     # Bias estimado do acelerômetro
+        self.bias_learning_rate = 0.05    # Taxa de aprendizado do bias
+        self.stationary_threshold = 1.55  # Limiar para detecção de repouso
+        self.stationary_count = 0
 
+    def update(self, quat, raw_acc, gyro):
+        # 1. Converte inputs para arrays numpy
+        raw_acc = np.array(raw_acc, dtype=np.float32) / 2048.0
+        
+        # 2. Calcula delta time
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        dt = min(dt, 0.02)  # Limita dt máximo para 20ms
+
+        # 3. Detecção de repouso e calibração de bias
+        if np.linalg.norm(raw_acc - [0, 0, 1]) < self.stationary_threshold:
+            self.stationary_count += 1
+            if self.stationary_count > 5:
+                self.accel_bias = 0.95 * self.accel_bias + 0.05 * (raw_acc - [0, 0, 1])
+        else:
+            self.stationary_count = 0
+        
+        calibrated_acc = raw_acc - self.accel_bias
+        
+        # 4. Processa dados do sensor
+        q = self._normalize_quaternion(quat)
+        rotated_acc = self._rotate_vector(calibrated_acc, q)
+        linear_acc = rotated_acc - self.gravity
+        
+        # 5. Filtro de suavização
+        self.acceleration = self.alpha * linear_acc + (1 - self.alpha) * self.accel_filter
+        self.accel_filter = self.acceleration.copy()
+
+        # 6. Método dos Trapézios para integração
+        avg_acc = 0.5 * (self.prev_acceleration + self.acceleration)
+        self.velocity += avg_acc * dt
+        
+        # 7. Amortecimento para reduzir drift
+        self.velocity *= self.velocity_damping
+        
+        # 8. Integração de posição
+        prev_velocity = self.velocity - avg_acc * dt
+        avg_vel = 0.5 * (prev_velocity + self.velocity)
+        self.position += avg_vel * dt
+        
+        # 9. Limites e histórico
+        self.position = np.clip(self.position, -0.5,0.5)
+        self.prev_acceleration = self.acceleration.copy()
+
+        # 10. Gerencia histórico
+        self.history.append(self.position.copy())
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+        return self.position.copy()
+
+    def get_current_state(self):
+        return {
+            'position': self.position.copy(),
+            'velocity': self.velocity.copy(),
+            'acceleration': self.acceleration.copy()
+        }
+
+    def get_history(self):
+        return np.array(self.history.copy())
+
+    def reset(self):
+        self.position.fill(0)
+        self.velocity.fill(0)
+        self.acceleration.fill(0)
+        self.prev_acceleration.fill(0)
+        self.history = []
+        self.last_time = time.time()
+        self.accel_bias = np.zeros(3)  # Reset bias também
+
+    def _normalize_quaternion(self, q):
+        q = np.array([x / 16384.0 for x in q])
+        norm = np.linalg.norm(q)
+        return q / norm if norm > 0 else np.array([1.0, 0, 0, 0])
+
+    def _rotate_vector(self, v, q):
+        qvec = q[1:]
+        uv = np.cross(qvec, v)
+        uuv = np.cross(qvec, uv)
+        uv *= (2.0 * q[0])
+        uuv *= 2.0
+        return v + uv + uuv
+        
 class Packet(object):
     def __init__(self, ords):
         self.typ = ords[0]
@@ -70,7 +181,14 @@ class BT(object):
         t0 = time.time()
         self.ser.timeout = None
         while timeout is None or time.time() < t0 + timeout:
-            if timeout is not None: self.ser.timeout = t0 + timeout - time.time()
+            if timeout is not None:
+                remaining = t0 + timeout - time.time()
+                if remaining <= 0:  # Evita valores negativos
+                    return None
+                self.ser.timeout = remaining
+            else:
+                self.ser.timeout = None
+                
             c = self.ser.read()
             if not c: return None
 
@@ -287,7 +405,6 @@ class MyoRaw(object):
                 acc = vals[4:7]
                 gyro = vals[7:10]
                 self.on_imu(quat, acc, gyro)
-                print(quat,acc)
             elif attr == 0x23:
                 typ, val, xdir = unpack('3B', pay[:3])
 
@@ -403,7 +520,7 @@ if __name__ == '__main__':
     try:
         import pygame
         from pygame.locals import *
-        HAVE_PYGAME = True
+        HAVE_PYGAME = False
     except ImportError:
         HAVE_PYGAME = False
 
@@ -453,16 +570,55 @@ if __name__ == '__main__':
         if len(times) > 20:
             #print((len(times) - 1) / (times[-1] - times[0]))
             times.pop(0)
+            
+    trajectory = Trajectory3D()
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    last_plot_time = time.time()
+    plot_active = True
 
+    def on_imu(quat, acc, gyro):
+        trajectory.update(quat, acc, gyro)
+        
+    m.add_imu_handler(on_imu)
     m.add_emg_handler(proc_emg)
     m.connect()
 
     m.add_arm_handler(lambda arm, xdir: print('arm', arm, 'xdir', xdir))
     m.add_pose_handler(lambda p: print('pose', p))
 
+    def update_3d_plot():
+        ax.clear()
+        hist = trajectory.get_history()
+        current_state = trajectory.get_current_state()
+        position = current_state['position']
+        
+        if len(hist) > 1:
+            ax.plot(hist[:,0], hist[:,1], hist[:,2], 'b-', linewidth=1.5)
+            ax.scatter([position[0]], [position[1]], [position[2]], c='r', s=50)
+        
+        # Configura escala fixa
+        b = 0.5
+        ax.set_xlim([-b, b])
+        ax.set_ylim([-b, b])
+        ax.set_zlim([-b, b])
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        ax.set_title('Trajetória 3D em Tempo Real')
+        
+        plt.draw()
+        plt.pause(0.001)
+
     try:
         while True:
-            m.run(1)
+            m.run(0.02)  # Loop mais rápido
+            
+            # Atualiza plot 3D a cada 0.1 segundos
+            if time.time() - last_plot_time >= 0.1 and plot_active:
+                update_3d_plot()
+                last_plot_time = time.time()
 
             if HAVE_PYGAME:
                 for ev in pygame.event.get():
@@ -473,7 +629,11 @@ if __name__ == '__main__':
                             m.vibrate(ev.key - K_0)
                         if K_KP1 <= ev.key <= K_KP3:
                             m.vibrate(ev.key - K_KP0)
-
+                        if ev.key == K_r:  # Reset com tecla 'r'
+                            trajectory.reset()
+                        if ev.key == K_p:  # Pausa/continua com tecla 'p'
+                            plot_active = not plot_active
+    
     except KeyboardInterrupt:
         pass
     finally:
