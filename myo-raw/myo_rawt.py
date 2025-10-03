@@ -15,108 +15,200 @@ from mpl_toolkits.mplot3d import Axes3D
 import serial
 from serial.tools.list_ports import comports
 
-from common import *
+# Adicionar importações para o EKF
+from scipy.linalg import inv, block_diag
 
-def multichr(ords):
-    if sys.version_info[0] >= 3:
-        return bytes(ords)
-    else:
-        return ''.join(map(chr, ords))
-
-def multiord(b):
-    if sys.version_info[0] >= 3:
-        return list(b)
-    else:
-        return map(ord, b)
-
-class Arm(enum.Enum):
-    UNKNOWN = 0
-    RIGHT = 1
-    LEFT = 2
-
-class XDirection(enum.Enum):
-    UNKNOWN = 0
-    X_TOWARD_WRIST = 1
-    X_TOWARD_ELBOW = 2
-
-class Pose(enum.Enum):
-    REST = 0
-    FIST = 1
-    WAVE_IN = 2
-    WAVE_OUT = 3
-    FINGERS_SPREAD = 4
-    THUMB_TO_PINKY = 5
-    UNKNOWN = 255
+class ExtendedKalmanFilter:
+    def __init__(self):
+        # Estado: [px, py, pz, vx, vy, vz, ax, ay, az] - 9 dimensões
+        self.n = 9
+        self.m = 6  # Medições: [ax, ay, az, gx, gy, gz]
+        
+        # Estado inicial
+        self.x = np.zeros(self.n)
+        
+        # Matriz de covariância do estado
+        self.P = np.eye(self.n) * 0.1
+        
+        # Matriz de covariância do processo (ruído do modelo)
+        self.Q = np.eye(self.n) * 0.01
+        
+        # Matriz de covariância da medição
+        self.R = np.eye(self.m) * 0.1
+        
+        # Matriz de transição de estado (será calculada a cada passo)
+        self.F = np.eye(self.n)
+        
+        # Matriz de observação (será calculada a cada passo)
+        self.H = np.zeros((self.m, self.n))
+        
+        # Timestamp anterior
+        self.last_time = time.time()
+        
+        # Gravidade
+        self.gravity = np.array([0, 0, 0.969])
+        
+    def predict(self, dt):
+        # Atualizar matriz de transição de estado
+        # Posição: p = p + v*dt + 0.5*a*dt²
+        # Velocidade: v = v + a*dt
+        # Aceleração: a = a (modelo de velocidade constante)
+        
+        # Preencher matriz F
+        self.F = np.eye(self.n)
+        
+        # Transição posição-velocidade
+        for i in range(3):
+            self.F[i, i+3] = dt
+            self.F[i, i+6] = 0.5 * dt**2
+            self.F[i+3, i+6] = dt
+        
+        # Predição do estado
+        self.x = self.F @ self.x
+        
+        # Predição da covariância
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        
+        return self.x.copy()
+    
+    def update(self, acceleration, gyro, quaternion):
+        # Converter medições para arrays numpy
+        z = np.concatenate([acceleration, gyro])
+        
+        # Calcular matriz de observação H (jacobiana da função de observação)
+        self._compute_observation_jacobian(quaternion)
+        
+        # Inovação (resíduo)
+        y = z - self._observation_function(quaternion)
+        
+        # Covariância da inovação
+        S = self.H @ self.P @ self.H.T + self.R
+        
+        # Ganho de Kalman
+        K = self.P @ self.H.T @ inv(S)
+        
+        # Atualização do estado
+        self.x = self.x + K @ y
+        
+        # Atualização da covariância (forma mais estável)
+        I = np.eye(self.n)
+        self.P = (I - K @ self.H) @ self.P
+        
+        return self.x.copy()
+    
+    def _observation_function(self, quaternion):
+        # Função de observação: transforma estado em medições esperadas
+        h = np.zeros(self.m)
+        
+        # As acelerações esperadas são as acelerações do estado + gravidade no frame global
+        # Rotacionar a gravidade para o frame do sensor usando o quaternion
+        q = self._normalize_quaternion(quaternion)
+        gravity_body = self._rotate_vector(self.gravity, self._quaternion_inverse(q))
+        
+        # Acelerações esperadas (primeiras 3 medições)
+        h[0:3] = self.x[6:9] + gravity_body
+        
+        # Giroscópio esperado (últimas 3 medições) - assumindo pequenas variações
+        # Em um modelo mais complexo, isso viria da derivada do quaternion
+        h[3:6] = np.zeros(3)  # Simplificação
+        
+        return h
+    
+    def _compute_observation_jacobian(self, quaternion):
+        # Jacobiana da função de observação em relação ao estado
+        self.H = np.zeros((self.m, self.n))
+        
+        # Para as acelerações: dh/dacceleration = I
+        self.H[0:3, 6:9] = np.eye(3)
+        
+        # Para o giroscópio: derivadas são zero na simplificação atual
+        # Em uma implementação mais completa, aqui viriam as derivadas da orientação
+        
+        return self.H
+    
+    def _normalize_quaternion(self, q):
+        q = np.array([x / 16384.0 for x in q])
+        norm = np.linalg.norm(q)
+        return q / norm if norm > 0 else np.array([1.0, 0, 0, 0])
+    
+    def _quaternion_inverse(self, q):
+        # Inverso do quaternion (conjugado)
+        return np.array([q[0], -q[1], -q[2], -q[3]])
+    
+    def _rotate_vector(self, v, q):
+        # Rotacionar vetor v pelo quaternion q
+        qvec = q[1:]
+        uv = np.cross(qvec, v)
+        uuv = np.cross(qvec, uv)
+        uv *= (2.0 * q[0])
+        uuv *= 2.0
+        return v + uv + uuv
+    
+    def get_state(self):
+        return {
+            'position': self.x[0:3].copy(),
+            'velocity': self.x[3:6].copy(),
+            'acceleration': self.x[6:9].copy()
+        }
+    
+    def reset(self):
+        self.x = np.zeros(self.n)
+        self.P = np.eye(self.n) * 0.1
+        self.last_time = time.time()
 
 class Trajectory3D:
-    def __init__(self, max_history=2):
-        # Estado atual
-        self.position = np.zeros(3)       # Posição atual (metros)
-        self.velocity = np.zeros(3)       # Velocidade atual (m/s)
-        self.acceleration = np.zeros(3)   # Aceleração atual (m/s²)
-        self.prev_acceleration = np.zeros(3)  # Aceleração anterior
+    def __init__(self, max_history=100):
+        # Usar Filtro de Kalman Estendido
+        self.ekf = ExtendedKalmanFilter()
         
         # Configuração
-        self.max_history = max_history    # Tamanho máximo do histórico
-        self.history = []                 # Buffer circular de posições
-        self.last_time = time.time()      # Último timestamp
-        self.gravity = np.array([0, 0.0, 0.969])  # Vetor gravidade
+        self.max_history = max_history
+        self.history = []
+        self.last_time = time.time()
         
-        # Filtros e parâmetros
-        self.accel_filter = np.zeros(3)   # Filtro para aceleração
-        self.alpha = 1                 # Fator de suavização
-        self.velocity_damping = 0.98      # Amortecimento de velocidade para reduzir drift
-        self.accel_bias = np.zeros(3)     # Bias estimado do acelerômetro
-        self.bias_learning_rate = 0.05    # Taxa de aprendizado do bias
-        self.stationary_threshold = 1.55  # Limiar para detecção de repouso
+        # Parâmetros para detecção de repouso
+        self.stationary_threshold = 1.55
         self.stationary_count = 0
+        self.accel_bias = np.zeros(3)
+        self.bias_learning_rate = 0.05
 
     def update(self, quat, raw_acc, gyro):
-        # 1. Converte inputs para arrays numpy
-        raw_acc = np.array(raw_acc, dtype=np.float32) / 2048.0
-        
-        # 2. Calcula delta time
+        # Converter inputs
         current_time = time.time()
         dt = current_time - self.last_time
         self.last_time = current_time
-        dt = min(dt, 0.02)  # Limita dt máximo para 20ms
-
-        # 3. Detecção de repouso e calibração de bias
-        if np.linalg.norm(raw_acc - [0, 0, 1]) < self.stationary_threshold:
+        dt = max(min(dt, 0.1), 0.001)  # Limitar dt entre 1ms e 100ms
+        
+        # Calibrar aceleração
+        calibrated_acc = np.array(raw_acc, dtype=np.float32) / 2048.0
+        
+        # Detecção de repouso para calibração
+        if np.linalg.norm(calibrated_acc - [0, 0, 1]) < self.stationary_threshold:
             self.stationary_count += 1
-            if self.stationary_count > 5:
-                self.accel_bias = 0.95 * self.accel_bias + 0.05 * (raw_acc - [0, 0, 1])
+            if self.stationary_count > 10:
+                self.accel_bias = 0.98 * self.accel_bias + 0.02 * (calibrated_acc - [0, 0, 1])
         else:
             self.stationary_count = 0
         
-        calibrated_acc = raw_acc - self.accel_bias
+        calibrated_acc = calibrated_acc - self.accel_bias
         
-        # 4. Processa dados do sensor
-        q = self._normalize_quaternion(quat)
-        rotated_acc = self._rotate_vector(calibrated_acc, q)
-        linear_acc = rotated_acc - self.gravity
+        # Converter giroscópio
+        calibrated_gyro = np.array(gyro, dtype=np.float32) / 16.0  # Escala aproximada
         
-        # 5. Filtro de suavização
-        self.acceleration = self.alpha * linear_acc + (1 - self.alpha) * self.accel_filter
-        self.accel_filter = self.acceleration.copy()
-
-        # 6. Método dos Trapézios para integração
-        avg_acc = 0.5 * (self.prev_acceleration + self.acceleration)
-        self.velocity += avg_acc * dt
+        # Executar Filtro de Kalman Estendido
+        # Predição
+        self.ekf.predict(dt)
         
-        # 7. Amortecimento para reduzir drift
-        self.velocity *= self.velocity_damping
+        # Atualização com medições
+        self.ekf.update(calibrated_acc, calibrated_gyro, quat)
         
-        # 8. Integração de posição
-        prev_velocity = self.velocity - avg_acc * dt
-        avg_vel = 0.5 * (prev_velocity + self.velocity)
-        self.position += avg_vel * dt
+        # Obter estado estimado
+        state = self.ekf.get_state()
+        self.position = state['position']
+        self.velocity = state['velocity'] 
+        self.acceleration = state['acceleration']
         
-        # 9. Limites e histórico
-        self.position = np.clip(self.position, -0.5,0.5)
-        self.prev_acceleration = self.acceleration.copy()
-
-        # 10. Gerencia histórico
+        # Gerir histórico
         self.history.append(self.position.copy())
         if len(self.history) > self.max_history:
             self.history.pop(0)
@@ -134,27 +226,13 @@ class Trajectory3D:
         return np.array(self.history.copy())
 
     def reset(self):
-        self.position.fill(0)
-        self.velocity.fill(0)
-        self.acceleration.fill(0)
-        self.prev_acceleration.fill(0)
+        self.ekf.reset()
         self.history = []
         self.last_time = time.time()
-        self.accel_bias = np.zeros(3)  # Reset bias também
+        self.accel_bias = np.zeros(3)
 
-    def _normalize_quaternion(self, q):
-        q = np.array([x / 16384.0 for x in q])
-        norm = np.linalg.norm(q)
-        return q / norm if norm > 0 else np.array([1.0, 0, 0, 0])
+# O resto do código permanece igual...
 
-    def _rotate_vector(self, v, q):
-        qvec = q[1:]
-        uv = np.cross(qvec, v)
-        uuv = np.cross(qvec, uv)
-        uv *= (2.0 * q[0])
-        uuv *= 2.0
-        return v + uv + uuv
-        
 class Packet(object):
     def __init__(self, ords):
         self.typ = ords[0]
@@ -481,7 +559,7 @@ class MyoRaw(object):
         self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
 
     def vibrate(self, length):
-        if length in xrange(1, 4):
+        if length in range(1, 4):
             ## first byte tells it to vibrate; purpose of second byte is unknown
             self.write_attr(0x19, pack('3B', 3, 1, length))
 
@@ -520,7 +598,7 @@ if __name__ == '__main__':
     try:
         import pygame
         from pygame.locals import *
-        HAVE_PYGAME = False
+        HAVE_PYGAME = True
     except ImportError:
         HAVE_PYGAME = False
 
@@ -606,7 +684,7 @@ if __name__ == '__main__':
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
-        ax.set_title('Trajetória 3D em Tempo Real')
+        ax.set_title('Trajetória 3D com Filtro de Kalman Estendido')
         
         plt.draw()
         plt.pause(0.001)
