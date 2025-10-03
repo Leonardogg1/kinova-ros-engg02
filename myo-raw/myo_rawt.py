@@ -3,9 +3,11 @@ from __future__ import print_function
 import enum
 import re
 import struct
+from struct import pack, unpack
 import sys
 import threading
 import time
+from common import *
 
 from scipy import signal
 import numpy as np
@@ -164,13 +166,30 @@ class Trajectory3D:
         # Configuração
         self.max_history = max_history
         self.history = []
+        self.history_direct = []  # Histórico da integração direta
         self.last_time = time.time()
+        
+        # Inicializar atributos de estado
+        self.position = np.zeros(3)
+        self.velocity = np.zeros(3)
+        self.acceleration = np.zeros(3)
+        
+        # Estado para integração direta (para comparação)
+        self.position_direct = np.zeros(3)
+        self.velocity_direct = np.zeros(3)
+        self.acceleration_direct = np.zeros(3)
+        self.prev_acceleration_direct = np.zeros(3)
         
         # Parâmetros para detecção de repouso
         self.stationary_threshold = 1.55
         self.stationary_count = 0
         self.accel_bias = np.zeros(3)
         self.bias_learning_rate = 0.05
+        
+        # Parâmetros para integração direta
+        self.velocity_damping = 0.95  # Amortecimento para reduzir drift
+        self.accel_filter = np.zeros(3)
+        self.alpha = 0.8  # Fator de suavização
 
     def update(self, quat, raw_acc, gyro):
         # Converter inputs
@@ -208,30 +227,118 @@ class Trajectory3D:
         self.velocity = state['velocity'] 
         self.acceleration = state['acceleration']
         
+        # Calcular também a integração direta para comparação
+        self._update_direct_integration(quat, calibrated_acc, dt)
+        
         # Gerir histórico
         self.history.append(self.position.copy())
+        self.history_direct.append(self.position_direct.copy())
         if len(self.history) > self.max_history:
             self.history.pop(0)
+            self.history_direct.pop(0)
 
         return self.position.copy()
+    
+    def _update_direct_integration(self, quat, calibrated_acc, dt):
+        # Integração direta para comparação (sem Kalman)
+        q = self._normalize_quaternion(quat)
+        rotated_acc = self._rotate_vector(calibrated_acc, q)
+        
+        # Remover gravidade (assumindo que sabemos a orientação)
+        gravity = np.array([0, 0, 0.969])
+        linear_acc = rotated_acc - gravity
+        
+        # Filtro de suavização
+        self.acceleration_direct = self.alpha * linear_acc + (1 - self.alpha) * self.accel_filter
+        self.accel_filter = self.acceleration_direct.copy()
+        
+        # Integração de velocidade
+        avg_acc = 0.5 * (self.prev_acceleration_direct + self.acceleration_direct)
+        self.velocity_direct += avg_acc * dt
+        
+        # Amortecimento para reduzir drift
+        self.velocity_direct *= self.velocity_damping
+        
+        # Integração de posição
+        prev_velocity = self.velocity_direct - avg_acc * dt
+        avg_vel = 0.5 * (prev_velocity + self.velocity_direct)
+        self.position_direct += avg_vel * dt
+        
+        self.prev_acceleration_direct = self.acceleration_direct.copy()
+
+    def _normalize_quaternion(self, q):
+        q = np.array([x / 16384.0 for x in q])
+        norm = np.linalg.norm(q)
+        return q / norm if norm > 0 else np.array([1.0, 0, 0, 0])
+    
+    def _rotate_vector(self, v, q):
+        qvec = q[1:]
+        uv = np.cross(qvec, v)
+        uuv = np.cross(qvec, uv)
+        uv *= (2.0 * q[0])
+        uuv *= 2.0
+        return v + uv + uuv
 
     def get_current_state(self):
         return {
             'position': self.position.copy(),
             'velocity': self.velocity.copy(),
-            'acceleration': self.acceleration.copy()
+            'acceleration': self.acceleration.copy(),
+            'position_direct': self.position_direct.copy()
         }
 
     def get_history(self):
         return np.array(self.history.copy())
+    
+    def get_direct_history(self):
+        return np.array(self.history_direct.copy())
 
     def reset(self):
         self.ekf.reset()
         self.history = []
+        self.history_direct = []
+        self.position = np.zeros(3)
+        self.velocity = np.zeros(3)
+        self.acceleration = np.zeros(3)
+        self.position_direct = np.zeros(3)
+        self.velocity_direct = np.zeros(3)
+        self.acceleration_direct = np.zeros(3)
+        self.prev_acceleration_direct = np.zeros(3)
         self.last_time = time.time()
         self.accel_bias = np.zeros(3)
 
-# O resto do código permanece igual...
+
+def multichr(ords):
+    if sys.version_info[0] >= 3:
+        return bytes(ords)
+    else:
+        return ''.join(map(chr, ords))
+
+def multiord(b):
+    if sys.version_info[0] >= 3:
+        return list(b)
+    else:
+        return map(ord, b)
+
+class Arm(enum.Enum):
+    UNKNOWN = 0
+    RIGHT = 1
+    LEFT = 2
+
+class XDirection(enum.Enum):
+    UNKNOWN = 0
+    X_TOWARD_WRIST = 1
+    X_TOWARD_ELBOW = 2
+
+class Pose(enum.Enum):
+    REST = 0
+    FIST = 1
+    WAVE_IN = 2
+    WAVE_OUT = 3
+    FINGERS_SPREAD = 4
+    THUMB_TO_PINKY = 5
+    UNKNOWN = 255
+
 
 class Packet(object):
     def __init__(self, ords):
@@ -259,14 +366,11 @@ class BT(object):
         t0 = time.time()
         self.ser.timeout = None
         while timeout is None or time.time() < t0 + timeout:
-            if timeout is not None:
+            if timeout is not None: 
                 remaining = t0 + timeout - time.time()
-                if remaining <= 0:  # Evita valores negativos
+                if remaining <= 0:
                     return None
                 self.ser.timeout = remaining
-            else:
-                self.ser.timeout = None
-                
             c = self.ser.read()
             if not c: return None
 
@@ -400,19 +504,34 @@ class MyoRaw(object):
         ## start scanning
         print('scanning...')
         self.bt.discover()
-        while True:
-            p = self.bt.recv_packet()
+        
+        start_time = time.time()
+        timeout = 10
+        addr = None
+        
+        while time.time() - start_time < timeout:
+            p = self.bt.recv_packet(0.5)
+            if p is None:
+                continue
+                
             print('scan response:', p)
 
             if p.payload.endswith(b'\x06\x42\x48\x12\x4A\x7F\x2C\x48\x47\xB9\xDE\x04\xA9\x01\x00\x06\xD5'):
                 addr = list(multiord(p.payload[2:8]))
+                print(f'Myo encontrado! Endereço: {addr}')
                 break
+        
         self.bt.end_scan()
 
+        if addr is None:
+            raise ValueError('Myo não encontrado após 10 segundos de scanning!')
+
         ## connect and wait for status event
+        print('connecting...')
         conn_pkt = self.bt.connect(addr)
         self.conn = multiord(conn_pkt.payload)[-1]
         self.bt.wait_event(3, 0)
+        print('connected!')
 
         ## get firmware version
         fw = self.read_attr(0x17)
@@ -593,12 +712,11 @@ class MyoRaw(object):
         for h in self.arm_handlers:
             h(arm, xdir)
 
-
 if __name__ == '__main__':
     try:
         import pygame
         from pygame.locals import *
-        HAVE_PYGAME = True
+        HAVE_PYGAME = False
     except ImportError:
         HAVE_PYGAME = False
 
@@ -650,8 +768,23 @@ if __name__ == '__main__':
             times.pop(0)
             
     trajectory = Trajectory3D()
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
+    
+    # Configurar os plots
+    plt.ion()
+    fig = plt.figure(figsize=(15, 10))
+    
+    # Plot 3D
+    ax1 = fig.add_subplot(231, projection='3d')
+    
+    # Plots 2D para cada eixo
+    ax2 = fig.add_subplot(232)
+    ax3 = fig.add_subplot(233)
+    ax4 = fig.add_subplot(234)
+    ax5 = fig.add_subplot(235)
+    ax6 = fig.add_subplot(236)
+    
+    plt.tight_layout()
+    
     last_plot_time = time.time()
     plot_active = True
 
@@ -665,26 +798,109 @@ if __name__ == '__main__':
     m.add_arm_handler(lambda arm, xdir: print('arm', arm, 'xdir', xdir))
     m.add_pose_handler(lambda p: print('pose', p))
 
-    def update_3d_plot():
-        ax.clear()
-        hist = trajectory.get_history()
+    def update_plots():
+        # Limpar todos os plots
+        ax1.clear()
+        ax2.clear()
+        ax3.clear()
+        ax4.clear()
+        ax5.clear()
+        ax6.clear()
+        
+        # Obter históricos
+        hist_ekf = trajectory.get_history()
+        hist_direct = trajectory.get_direct_history()
         current_state = trajectory.get_current_state()
         position = current_state['position']
+        position_direct = current_state['position_direct']
         
-        if len(hist) > 1:
-            ax.plot(hist[:,0], hist[:,1], hist[:,2], 'b-', linewidth=1.5)
-            ax.scatter([position[0]], [position[1]], [position[2]], c='r', s=50)
+        # Plot 3D - Trajetória
+        if len(hist_ekf) > 1:
+            # Trajetória EKF
+            ax1.plot(hist_ekf[:,0], hist_ekf[:,1], hist_ekf[:,2], 'b-', linewidth=2, label='EKF')
+            ax1.scatter([position[0]], [position[1]], [position[2]], c='b', s=50, marker='o')
+            
+            # Trajetória integração direta
+            ax1.plot(hist_direct[:,0], hist_direct[:,1], hist_direct[:,2], 'r-', linewidth=1, alpha=0.7, label='Integração Direta')
+            ax1.scatter([position_direct[0]], [position_direct[1]], [position_direct[2]], c='r', s=30, marker='x')
+            
+            # Configurar plot 3D
+            b = 0.5
+            ax1.set_xlim([-b, b])
+            ax1.set_ylim([-b, b])
+            ax1.set_zlim([-b, b])
+            ax1.set_xlabel('X (m)')
+            ax1.set_ylabel('Y (m)')
+            ax1.set_zlabel('Z (m)')
+            ax1.set_title('Trajetória 3D - EKF vs Integração Direta')
+            ax1.legend()
         
-        # Configura escala fixa
-        b = 0.5
-        ax.set_xlim([-b, b])
-        ax.set_ylim([-b, b])
-        ax.set_zlim([-b, b])
+        # Plot 2D - Comparação por eixo
+        time_axis = np.arange(len(hist_ekf))
         
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m)')
-        ax.set_title('Trajetória 3D com Filtro de Kalman Estendido')
+        # Eixo X - só adicionar legenda se houver dados
+        if len(hist_ekf) > 0:
+            line_x_ekf, = ax2.plot(time_axis, hist_ekf[:,0], 'b-', label='EKF')
+            line_x_direct, = ax2.plot(time_axis, hist_direct[:,0], 'r-', alpha=0.7, label='Integração Direta')
+            ax2.legend()
+        ax2.set_xlabel('Amostras')
+        ax2.set_ylabel('X (m)')
+        ax2.set_title('Posição X')
+        ax2.grid(True)
+        
+        # Eixo Y - só adicionar legenda se houver dados
+        if len(hist_ekf) > 0:
+            line_y_ekf, = ax3.plot(time_axis, hist_ekf[:,1], 'b-', label='EKF')
+            line_y_direct, = ax3.plot(time_axis, hist_direct[:,1], 'r-', alpha=0.7, label='Integração Direta')
+            ax3.legend()
+        ax3.set_xlabel('Amostras')
+        ax3.set_ylabel('Y (m)')
+        ax3.set_title('Posição Y')
+        ax3.grid(True)
+        
+        # Eixo Z - só adicionar legenda se houver dados
+        if len(hist_ekf) > 0:
+            line_z_ekf, = ax4.plot(time_axis, hist_ekf[:,2], 'b-', label='EKF')
+            line_z_direct, = ax4.plot(time_axis, hist_direct[:,2], 'r-', alpha=0.7, label='Integração Direta')
+            ax4.legend()
+        ax4.set_xlabel('Amostras')
+        ax4.set_ylabel('Z (m)')
+        ax4.set_title('Posição Z')
+        ax4.grid(True)
+        
+        # Diferenças entre EKF e integração direta - só adicionar legenda se houver dados
+        if len(hist_ekf) > 0:
+            diff = hist_ekf - hist_direct
+            line_diff_x, = ax5.plot(time_axis, diff[:,0], 'g-', label='X')
+            line_diff_y, = ax5.plot(time_axis, diff[:,1], 'orange', label='Y')
+            line_diff_z, = ax5.plot(time_axis, diff[:,2], 'red', label='Z')
+            ax5.legend()
+        ax5.set_xlabel('Amostras')
+        ax5.set_ylabel('Diferença (m)')
+        ax5.set_title('Diferença EKF - Integração Direta')
+        ax5.grid(True)
+        
+        # Valores atuais
+        current_data = {
+            'EKF X': position[0],
+            'EKF Y': position[1], 
+            'EKF Z': position[2],
+            'Direct X': position_direct[0],
+            'Direct Y': position_direct[1],
+            'Direct Z': position_direct[2]
+        }
+        
+        bars = ax6.bar(range(len(current_data)), list(current_data.values()))
+        ax6.set_xticks(range(len(current_data)))
+        ax6.set_xticklabels(list(current_data.keys()), rotation=45)
+        ax6.set_ylabel('Posição (m)')
+        ax6.set_title('Valores Atuais')
+        
+        # Adicionar valores nas barras
+        for i, bar in enumerate(bars):
+            height = bar.get_height()
+            ax6.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.3f}', ha='center', va='bottom', fontsize=8)
         
         plt.draw()
         plt.pause(0.001)
@@ -693,9 +909,9 @@ if __name__ == '__main__':
         while True:
             m.run(0.02)  # Loop mais rápido
             
-            # Atualiza plot 3D a cada 0.1 segundos
+            # Atualiza plots a cada 0.1 segundos
             if time.time() - last_plot_time >= 0.1 and plot_active:
-                update_3d_plot()
+                update_plots()
                 last_plot_time = time.time()
 
             if HAVE_PYGAME:
